@@ -47,15 +47,9 @@ async fn test_bid() {
 
     // Now, let's make a transaction
     let recipient = PublicKey::default();
-    let tx = client::create_transaction(
-        sk,
-        100_000 as u64,
-        100 as u64,
-        recipient.into(),
-        true,
-    )
-    .await
-    .unwrap();
+    let tx = client::create_bid(sk, 100_000 as u64, 100 as u64)
+        .await
+        .unwrap();
 
     // And execute it on the VM
     let response = client::validate_state_transition(tx).await.unwrap();
