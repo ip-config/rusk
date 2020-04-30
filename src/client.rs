@@ -38,6 +38,9 @@ pub async fn create_bid(
 
     let request = tonic::Request::new(rpc::BidTransactionRequest {
         m: [0u8; 32].to_vec(),
+        expiration_height: 100,
+        pk: [5u8; 32].to_vec(),
+        seed: [10u8; 32].to_vec(),
         tx: Some(rpc::NewTransactionRequest {
             sk: Some(sk.into()),
             inputs: response.into_inner().notes,
@@ -63,6 +66,7 @@ pub async fn validate_state_transition(
         calls: vec![rpc::ContractCall {
             contract_call: Some(rpc::contract_call::ContractCall::Tx(tx)),
         }],
+        current_height: 1,
     });
     let response = client.validate_state_transition(request).await?;
 
