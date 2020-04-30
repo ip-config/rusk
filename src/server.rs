@@ -5,7 +5,10 @@ use phoenix::{
     NoteVariant, ObfuscatedNote, PublicKey, SecretKey, Transaction,
     TransactionInput, TransactionItem, TransparentNote, ViewKey,
 };
-use phoenix_abi::{Input as ABIInput, Note as ABINote, Proof as ABIProof};
+use phoenix_abi::{
+    Input as ABIInput, Note as ABINote, Proof as ABIProof,
+    PublicKey as ABIPublicKey,
+};
 use rusk_vm::dusk_abi::H256;
 use rusk_vm::{Contract, GasMeter, NetworkState, Schedule, StandardABI};
 use std::convert::{TryFrom, TryInto};
@@ -17,8 +20,37 @@ fn error_to_tonic(e: Error) -> tonic::Status {
     e.into()
 }
 
+// Converts an RPC transaction to an ABI transaction.
+// TODO: this conversion should be properly implemented on the type itself
+fn convert_tx(
+    t: rpc::Transaction,
+) -> ([ABIInput; ABIInput::MAX], [ABINote; ABINote::MAX], ABIProof) {
+    let mut input_arr = [ABIInput::default(); ABIInput::MAX];
+    let mut note_arr = [ABINote::default(); ABINote::MAX];
+
+    for (i, input) in t.inputs.iter().enumerate() {
+        let abi_input = ABIInput::try_from(input).ok()?;
+        input_arr[i] = abi_input;
+    }
+
+    for (i, output) in t.outputs.iter().enumerate() {
+        let abi_note = ABINote::try_from(output).ok()?;
+        note_arr[i] = abi_note;
+    }
+
+    let fee_note = ABINote::try_from(t.fee.as_ref()?).ok()?;
+    note_arr[ABINote::MAX - 1] = fee_note;
+
+    let mut proof_buf = [0u8; ABIProof::SIZE];
+    proof_buf.copy_from_slice(&t.proof);
+    let proof = ABIProof::from_bytes(proof_buf);
+
+    (input_arr, note_arr, proof)
+}
+
 pub struct Rusk {
     transfer_id: H256,
+    bid_id: H256,
 }
 
 // Transfer Contract's `transfer` method
@@ -38,6 +70,23 @@ struct TransferCall(
 
 unsafe impl Pod for TransferCall {}
 
+#[repr(C, packed)]
+struct BidCall(
+    [ABIInput; ABIInput::MAX],
+    [ABINote; ABINote::MAX],
+    ABIProof,
+    ABIPublicKey,
+    u64,
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+    [u8; 24],
+    [u8; 48],
+    u64,
+);
+
+unsafe impl Pod for BidCall {}
+
 impl Default for Rusk {
     fn default() -> Self {
         let schedule = Schedule::default();
@@ -55,8 +104,19 @@ impl Default for Rusk {
 
         let transfer_id = network.deploy(transfer_contract).unwrap();
 
+        let bid_contract = Contract::new(
+            fs::read("./contracts/bid/target/wasm32-unknown-unknown/release/bid.wasm").unwrap().as_slice(),
+            &schedule,
+        )
+        .unwrap();
+
+        let bid_id = network.deploy(bid_contract).unwrap();
+
         root.set_root(&mut network).unwrap();
-        Self { transfer_id }
+        Self {
+            transfer_id,
+            bid_id,
+        }
     }
 }
 
@@ -81,33 +141,15 @@ impl rpc::rusk_server::Rusk for Rusk {
         let mut network: NetworkState<StandardABI<_>, Blake2b> =
             root.restore()?;
 
+        let current_height = request.into_inner().current_height;
         let correct_txs: Vec<rpc::ContractCall> = request
             .into_inner()
             .calls
             .into_iter()
             .filter_map(|t| match t.contract_call? {
                 rpc::contract_call::ContractCall::Tx(t) => {
-                    let mut input_arr = [ABIInput::default(); ABIInput::MAX];
-                    let mut note_arr = [ABINote::default(); ABINote::MAX];
-
-                    for (i, input) in t.inputs.iter().enumerate() {
-                        let abi_input = ABIInput::try_from(input).ok()?;
-                        input_arr[i] = abi_input;
-                    }
-
-                    for (i, output) in t.outputs.iter().enumerate() {
-                        let abi_note = ABINote::try_from(output).ok()?;
-                        note_arr[i] = abi_note;
-                    }
-
-                    let fee_note = ABINote::try_from(t.fee.as_ref()?).ok()?;
-                    note_arr[ABINote::MAX - 1] = fee_note;
-
+                    let (input_arr, note_arr, proof) = convert_tx(t);
                     let mut gas = GasMeter::with_limit(1_000_000_000);
-
-                    let mut proof_buf = [0u8; ABIProof::SIZE];
-                    proof_buf.copy_from_slice(&t.proof);
-                    let proof = ABIProof::from_bytes(proof_buf);
 
                     let result = network
                         .call_contract_operation::<TransferCall, i32>(
@@ -118,7 +160,7 @@ impl rpc::rusk_server::Rusk for Rusk {
                         )
                         .ok()?;
 
-                    // Call Succeed, but if `result` is `0` something in the c
+                    // Call Succeed, but if `result` is `0` something in the
                     // contract went wrong.
                     //
                     // TODO: need a better way to handle that; this is just
@@ -139,6 +181,61 @@ impl rpc::rusk_server::Rusk for Rusk {
                     })
                 }
                 // TODO: add logic for handling other types of contract calls
+                rpc::contract_call::ContractCall::Bid(bid) => {
+                    let (input_arr, note_arr, proof) = convert_tx(bid.tx?);
+                    let mut gas = GasMeter::with_limit(1_000_000_000);
+
+                    let mut pk_buf = [0u8; 64];
+                    pk_buf.copy_from_slice(&bid.pk);
+
+                    let mut seed_buf = [0u8; 32];
+                    seed_buf.copy_from_slice(&bid.seed);
+
+                    let mut m_buf = [0u8; 32];
+                    m_buf.copy_from_slice(&bid.m);
+
+                    let mut commitment_buf = [0u8; 32];
+                    commitment_buf.copy_from_slice(&bid.commitment);
+
+                    let mut enc_value_buf = [0u8; 24];
+                    enc_value_buf.copy_from_slice(&bid.encrypted_value);
+
+                    let mut enc_blinder_buf = [0u8; 48];
+                    enc_blinder_buf.copy_from_slice(&bid.encrypted_blinder);
+
+                    let result = network
+                        .call_contract_operation::<BidCall, i32>(
+                            self.bid_id,
+                            1, // Bid opcode
+                            BidCall(
+                                input_arr,
+                                note_arr,
+                                proof,
+                                pk_buf.into(),
+                                bid.expiration_height,
+                                seed_buf,
+                                m_buf,
+                                commitment_buf,
+                                enc_value_buf,
+                                enc_blinder_buf,
+                                current_height,
+                            ),
+                            &mut gas,
+                        )
+                        .ok()?;
+
+                    if result == 0 {
+                        panic!(
+                            "Smart Contract execution returns failure status"
+                        );
+                    }
+
+                    Some(rpc::ContractCall {
+                        contract_call: Some(
+                            rpc::contract_call::ContractCall::Bid(bid),
+                        ),
+                    })
+                }
                 _ => None,
             })
             .collect();
@@ -245,6 +342,7 @@ impl rpc::rusk_server::Rusk for Rusk {
                 "no secret key provided",
             )
         })?;
+
         // Ensure PK exists
         let pk = request.recipient.ok_or_else(|| {
             tonic::Status::new(
@@ -401,10 +499,118 @@ impl rpc::rusk_server::Rusk for Rusk {
     // TODO: implement
     async fn new_bid(
         &self,
-        _request: tonic::Request<rpc::BidTransactionRequest>,
+        request: tonic::Request<rpc::BidTransactionRequest>,
     ) -> Result<tonic::Response<rpc::BidTransaction>, tonic::Status> {
         trace!("Incoming new bid request");
-        unimplemented!()
+        let tx_req = request.into_inner().tx.ok_or_else(|| {
+            tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "no tx request provided",
+            )
+        })?;
+
+        // Ensure the SK exists
+        let sk = tx_req.sk.ok_or_else(|| {
+            tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "no secret key provided",
+            )
+        })?;
+
+        // Ensure PK exists
+        let pk = tx_req.recipient.ok_or_else(|| {
+            tonic::Status::new(
+                tonic::Code::InvalidArgument,
+                "no secret key provided",
+            )
+        })?;
+
+        let input_amount =
+            tx_req.inputs.iter().fold(0, |acc, input| acc + input.value);
+        if input_amount < tx_req.value + tx_req.fee {
+            return Err(tonic::Status::new(
+                tonic::Code::Cancelled,
+                "input amount too low",
+            ));
+        }
+
+        // When creating a bid, the `value` parameter is what we are going to "burn".
+        // So, we only add a change and fee output.
+        // We will still make the output note, which contains the information for
+        // the `approve` call.
+        let mut tx = Transaction::default();
+
+        let db_path = &std::env::var("PHOENIX_DB").or_else(|_| {
+            Err(tonic::Status::new(
+                tonic::Code::Internal,
+                "could not get db path",
+            ))
+        })?;
+
+        let inputs: Vec<TransactionInput> = tx_req
+            .inputs
+            .into_iter()
+            .map(|input| {
+                // TODO: handle this error properly
+                let note = match input.note_type.try_into()? {
+                    rpc::NoteType::Transparent => NoteVariant::Transparent(
+                        TransparentNote::try_from(input)?,
+                    ),
+                    rpc::NoteType::Obfuscated => NoteVariant::Obfuscated(
+                        ObfuscatedNote::try_from(input)?,
+                    ),
+                };
+
+                let merkle_proof =
+                    db::merkle_opening(Path::new(db_path), &note)?;
+                Ok(note
+                    .to_transaction_input(merkle_proof, sk.clone().try_into()?))
+            })
+            .collect::<Result<Vec<TransactionInput>, tonic::Status>>()?;
+
+        // TODO: when we can add more than one, turn this into a for loop
+        tx.push_input(inputs[0])?;
+
+        let pk: PublicKey = pk.try_into()?;
+        let (note, _blinding_factor) =
+            ObfuscatedNote::output(&pk, tx_req.value);
+
+        let change = inputs[0].value() - (tx_req.value + tx_req.fee);
+        if change > 0 {
+            let secret_key: SecretKey = sk.try_into()?;
+            let pk = secret_key.public_key();
+            let output = {
+                let (note, blinding_factor) =
+                    ObfuscatedNote::output(&pk, change);
+                note.to_transaction_output(change, blinding_factor, pk)
+            };
+
+            tx.push_output(output)?;
+        }
+
+        // Make fee note
+        let (note, blinding_factor) = TransparentNote::output(&pk, tx_req.fee);
+
+        tx.set_fee(note.to_transaction_output(tx_req.fee, blinding_factor, pk));
+
+        tx.prove()?;
+
+        let mut commitment_buf = [0u8; 32];
+        utils::serialize_bls_scalar(
+            note.value_commitment(),
+            &mut commitment_buf,
+        )?;
+        Ok(tonic::Response::new(rpc::BidTransaction {
+            m: request.into_inner().m,
+            commitment: commitment_buf.to_vec(),
+            encrypted_value: note.encrypted_value().unwrap().to_vec(),
+            encrypted_blinder: note.encrypted_blinding_factor().to_vec(),
+            expiration_height: 100,
+            pk: request.into_inner().pk,
+            seed: request.into_inner().seed,
+            r: vec![], // TODO: what do i put here?
+            tx: Some(tx.try_into()?),
+        }))
     }
 
     // TODO: implement
