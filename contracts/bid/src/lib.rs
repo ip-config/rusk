@@ -15,15 +15,24 @@ mod bid {
         proof: Proof,
         pk: PublicKey,
         expiry_height: u64,
-        // m: M,
+        seed: [u8; 32],
+        m: [u8; 32],
+        commitment: [u8; 32],
+        enc_value: [u8; 24],
+        enc_blinder: [u8; 48],
+        current_height: u64,
     ) -> i32 {
         if m.address != dusk_abi::self_hash() {
             return 0;
         }
 
-        // TODO: this should call `transfer_from`
-        if dusk_abi::call_contract::<(Inputs, Notes, Proof), i32>(
+        if expiry_height < current_height {
+            return 0;
+        }
+
+        if dusk_abi::call_contract_operation::<(Inputs, Notes, Proof), i32>(
             &transfer_contract,
+            2, // approve opcode
             0,
             (inputs, notes, proof),
         ) == 0
@@ -57,6 +66,7 @@ mod bid {
 
         if dusk_abi::call_contract::<(Notes, Proof), i32>(
             &transfer_contract,
+            3, // transfer_from opcode
             0,
             (notes, proof),
         ) == 0
